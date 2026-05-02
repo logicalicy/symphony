@@ -6,9 +6,11 @@ Purpose: Define a service that orchestrates coding agents to get project work do
 
 ## 1. Problem Statement
 
-Symphony is a long-running automation service that continuously reads work from an issue tracker
-(Linear in this specification version), creates an isolated workspace for each issue, and runs a
-coding agent session for that issue inside the workspace.
+Symphony is a long-running automation service that continuously reads work from an issue tracker,
+creates an isolated workspace for each issue, and runs a coding agent session for that issue inside
+the workspace. This specification uses Linear as the primary tracker example and Codex as the primary
+agent example, but the contracts are designed for any tracker backend and any coding agent that can
+run as a subprocess.
 
 The service solves four operational problems:
 
@@ -291,6 +293,23 @@ Loader behavior:
 - If the file cannot be read, return `missing_workflow_file` error.
 - The workflow file is expected to be repository-owned and version-controlled.
 
+#### 5.1.1 Multiple Workflow Files (Recommended Extension)
+
+Implementations may support multiple workflow files (for example `WORKFLOW-dev.md`,
+`WORKFLOW-pr-review.md`) to serve different boards or purposes from the same codebase.
+
+When multiple workflows are used:
+
+- Each workflow file should map to a separate orchestrator instance with its own tracker config,
+  workspace root, and server port.
+- A registry file (for example `workers.json`) may map deployment names to their workflow file,
+  project identifier, port, and workspace root.
+- A top-level runner script should launch all orchestrators in parallel.
+- Each orchestrator instance should be independently conformant to this spec — multi-workflow
+  coordination is out of scope.
+- Per-workflow state isolation (for example persistent budget files) should use the workflow name as
+  a namespace to prevent cross-contamination.
+
 ### 5.2 File Format
 
 `WORKFLOW.md` is a Markdown file with optional YAML front matter.
@@ -342,19 +361,50 @@ Fields:
 
 - `kind` (string)
   - Required for dispatch.
-  - Current supported value: `linear`
+  - Reference value: `linear`
+  - Implementations may support additional tracker kinds (for example `github` for GitHub Projects
+    v2). Each tracker kind defines its own required fields, endpoint defaults, and auth mechanism.
 - `endpoint` (string)
   - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
+  - Default for `tracker.kind == "github"`: `https://api.github.com/graphql`
 - `api_key` (string)
   - May be a literal token or `$VAR_NAME`.
   - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
+  - Canonical environment variable for `tracker.kind == "github"`: `GITHUB_TOKEN`.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
 - `project_slug` (string)
-  - Required for dispatch when `tracker.kind == "linear"`.
+  - Required for dispatch when `tracker.kind == "linear"` (maps to Linear `slugId`).
+  - Semantics are tracker-kind-dependent (for example `owner/repo` format for GitHub).
+- `project_number` (integer, optional)
+  - Alternative project identifier for trackers that use numeric board IDs (for example GitHub
+    Projects v2 board number).
+  - Required for dispatch when `tracker.kind == "github"`.
+- `status_field` (string, optional)
+  - Name of the status/state field on the tracker board. Required when the tracker does not have a
+    fixed state field name (for example GitHub Projects v2 single-select fields).
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+- `working_state` (string, optional)
+  - When set, must be a member of `active_states`.
+  - On dispatch, the orchestrator should transition the issue to this state in the tracker.
+  - Acts as a distributed lock: issues in `working_state` are excluded from candidate selection
+    unless already claimed by the current orchestrator instance.
+  - See Section 8.9 for startup recovery behavior.
+- `done_state` (string, optional)
+  - When set, must be a member of `terminal_states`.
+  - Names the explicit terminal state to which a successful verdict closes an issue. Implementations
+    that route verdicts to states (Section 5.3.7) should validate that any close-to-terminal mapping
+    targets `done_state` rather than inferring "first terminal state".
+- `paused_states` (list of strings, optional)
+  - States where an issue is parked but eligible to revive (worker- or operator-driven). Excluded
+    from candidate selection while parked. Distinct from `terminal_states` because an externally
+    posted comment or operator action can return them to `active_states`.
+- `backlog_states` (list of strings, optional)
+  - Operator-only park states (deferred work). Never a valid `verdict_state_map` target — config
+    validation should reject any verdict route into a backlog state. Only operator skills may move
+    issues into or out of these states.
 
 #### 5.3.2 `polling` (object)
 
@@ -415,6 +465,23 @@ Fields:
 
 #### 5.3.6 `codex` (object)
 
+Note: Implementations using a different coding agent (for example Claude Code CLI) should define an
+equivalent config section (for example `claude`) with fields appropriate to their agent's integration
+model. The fields below are Codex-specific; the logical contract is: command to launch, policy
+settings, and timeout values.
+
+Logical field mapping for common alternative agents:
+
+| Codex field | Logical purpose | Claude Code equivalent |
+|-------------|----------------|----------------------|
+| `command` | Agent executable | `command` (default `claude`) |
+| `approval_policy` | Permission model | `allowed_tools` (list of tool names) |
+| `thread_sandbox` | Sandbox mode | N/A (CLI manages its own sandbox) |
+| `turn_sandbox_policy` | Per-turn sandbox | N/A |
+| `turn_timeout_ms` | Turn time limit | `turn_timeout_ms` |
+| `read_timeout_ms` | Startup timeout | `read_timeout_ms` |
+| `stall_timeout_ms` | Inactivity timeout | `stall_timeout_ms` |
+
 Fields:
 
 For Codex-owned config values such as `approval_policy`, `thread_sandbox`, and
@@ -442,6 +509,51 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+
+#### 5.3.7 `verdict_state_map` (object, Recommended Extension)
+
+When the worker writes a structured verdict (Section 10.4.1), the workflow can declare an explicit
+verdict-to-state routing table instead of relying on the orchestrator inferring close-vs-handoff
+from heuristics.
+
+Schema:
+
+- Map keys are verdict tokens drawn from a closed alphabet declared by the workflow (for example
+  `DONE`, `APPROVE`, `UNABLE`, `AWAITING_ANSWERS`, `CHANGES_REQUESTED`, `SKIP`).
+- Map values are tracker state names that must be members of `tracker.active_states`,
+  `tracker.paused_states`, or `tracker.terminal_states`.
+- Map values must NOT name a `tracker.backlog_states` entry — backlog is operator-only.
+- Closing routes (values in `terminal_states`) should target `tracker.done_state` if it is set.
+
+Validation:
+
+- A verdict written by a worker that does not appear in the workflow's `verdict_state_map` should
+  halt rather than fall back to a default. See Section 8.10 for the halt mechanism.
+- Missing verdict files (`.symphony/verdict.txt` absent at end of run) should also halt — the
+  orchestrator must not guess intent from exit code or commit count alone.
+
+Rationale: a closed verdict alphabet plus an explicit routing table makes worker intent reviewable
+in front matter and prevents silent state-machine drift when a new verdict appears in worker prompt
+edits.
+
+#### 5.3.8 `rules` (object, Recommended Extension)
+
+A workflow may declare per-workflow worker constraints separately from the prompt body. The runtime
+should surface these to the worker prompt and (where mechanically enforceable) check them at end of
+run.
+
+Schema:
+
+- `must` (list of strings)
+  - Imperative requirements (for example "Commit every file you create before exiting").
+- `must_not` (list of strings)
+  - Negative requirements (for example "Do not edit files outside `.symphony/`").
+- `limits` (object, optional)
+  - `max_diff_loc` (integer) — reject runs whose total diff exceeds this LOC count.
+  - Other implementation-defined per-run hard caps.
+
+Rules act as a compile-time-style worker contract: the prompt body is the design intent; the rules
+block is the invariant the runtime should police.
 
 ### 5.4 Prompt Template Contract
 
@@ -482,6 +594,27 @@ Dispatch gating behavior:
 
 - Workflow file read/YAML errors block new dispatches until fixed.
 - Template errors fail only the affected run attempt.
+
+### 5.6 Generated Workflow Alphabets (Recommended Extension)
+
+Implementations using statically typed reducers may add a build step that reads each workflow's
+front matter (`verdict_state_map`, `active_states`, `paused_states`, `terminal_states`) and emits a
+type module per workflow exporting closed-union types for that workflow's verdicts and states.
+
+Recommended properties:
+
+- The codegen step runs as part of the normal build (for example `codegen:workflows` script run
+  before `tsc`).
+- Generated files live under a known directory (for example `src/reducer/generated/`) and are
+  checked in so that diffs are reviewable.
+- The reducer's switch statements over verdicts and states are exhaustiveness-checked at compile
+  time against these unions.
+- A new verdict appearing in a workflow's `verdict_state_map` shifts a build failure, not a runtime
+  fallback. Operators see drift at PR time, not in production logs.
+
+This is not required by the core spec — interpreted-language implementations may achieve similar
+guarantees through runtime validation against the same front matter — but it is the recommended
+pattern for typed implementations.
 
 ## 6. Configuration Specification
 
@@ -680,6 +813,44 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Restart recovery is tracker-driven and filesystem-driven (no durable orchestrator DB required).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
+### 7.5 Pure Reducer Architecture (Recommended Extension)
+
+Implementations may split the orchestrator into a pure reducer and an effectful interpreter. The
+reducer is a side-effect-free function `decide(state, event, spec) -> { state', effects[] }`; the
+interpreter executes the effect array (tracker writes, subprocess launches, file writes, timers).
+
+Properties of the pure reducer:
+
+- No I/O. No clock. No randomness. No network. No filesystem. No environment access. No mutation
+  of inputs.
+- All inputs are arguments; all outputs are the returned tuple.
+- Determinism: same `(state, event, spec)` always produces the same `(state', effects)`.
+
+Why this is a recommended pattern:
+
+- **Replayability**: a recorded event log (Section 13.9) plus the initial state reproduces the
+  exact effect sequence in production. Forensic reconstruction does not require live infrastructure.
+- **Property tests**: the reducer can be exercised at thousands of events per second under
+  randomized inputs to catch state-machine drift before it ships.
+- **Type-checked exhaustiveness**: combined with generated workflow alphabets (Section 5.6) the
+  reducer's switch statements over verdicts and states are exhaustive at compile time.
+
+Mechanical enforcement (recommended):
+
+- Isolate the reducer module so it compiles without dependencies on tracker clients, subprocess
+  helpers, or any runtime singleton.
+- Add an import-boundary lint that rejects reducer imports of effectful modules.
+- Add an identifier-boundary lint that rejects banned tokens inside the reducer file (`Date.now`,
+  `Math.random`, `process.env`, `fetch`, `fs.`, `Octokit`, etc.).
+- Run reducer property tests in CI as a gate.
+
+Boundary contract: any module the reducer imports is also pure. The interpreter is the only place
+side effects happen.
+
+This pattern is the Tea / Elm Architecture applied to long-running orchestration. It is not
+required by the core spec — implementations may use a more imperative orchestrator — but it makes
+correctness arguments dramatically easier.
+
 ## 8. Polling, Scheduling, and Reconciliation
 
 ### 8.1 Poll Loop
@@ -800,6 +971,177 @@ When the service starts:
 
 This prevents stale terminal workspaces from accumulating after restarts.
 
+### 8.7 Rate-Limit Gating (Recommended Extension)
+
+When the coding agent emits rate-limit events with explicit timing hints, the orchestrator should
+suppress new dispatches until the deadline passes. Running agents handle their own in-session
+retries; only new dispatch is gated.
+
+Gating semantics:
+
+- Inspect rate-limit event payloads for explicit timing fields: `retry_after` (seconds),
+  `reset_at` (ISO timestamp), or `reset` (epoch timestamp).
+- When a timing hint is present and the associated status indicates exhaustion (for example
+  `exceeded`, `exhausted`, `throttled`, `limited`), set a monotonic gate deadline.
+- While `now < gate_deadline`, skip new dispatches in the tick loop.
+- Informational rate-limit events without timing hints should be recorded for observability but
+  should not trigger gating.
+- If multiple rate-limit events arrive, the latest deadline wins (extend, never shorten).
+
+This prevents thundering-herd behavior when multiple concurrent agents encounter API throttling
+simultaneously.
+
+### 8.8 Budget Guards (Recommended Extension)
+
+The core spec defines retry delay caps (`agent.max_retry_backoff_ms`) and per-run turn caps
+(`agent.max_turns`) but does not cap continuation count, failure retry count, or per-issue cost. A
+worker that always exhausts its turn budget can loop indefinitely, and a worker that keeps failing
+can retry forever with only the backoff delay bounded.
+
+Implementations should consider adding per-issue budget caps:
+
+- `agent.max_continuations` (integer, recommended default: `5`)
+  - Caps the number of continuation cycles per issue. When a worker succeeds with
+    `reachedTurnLimit=true`, increment a per-issue continuation counter. If it reaches the cap,
+    release the claim and stop. The issue stays in its current tracker state for human review.
+- `agent.max_failure_retries` (integer, recommended default: `3`)
+  - Caps the number of failure retry attempts per issue. On each failure, increment a per-issue
+    failure counter. If it reaches the cap, release the claim and stop.
+- `agent.max_cost_per_issue_usd` (number, recommended default: `5.0`)
+  - Cumulative dollar cap across all runs (continuations + retries + initial attempt) for one issue.
+    Before scheduling a continuation or retry, check the budget; if exceeded, stop.
+
+Per-issue counters should be tracked in a `issue_limits` map within runtime state. See Section
+14.3.1 for persistence recommendations.
+
+### 8.9 Working-State Dispatch Lock and Startup Reset (Recommended Extension)
+
+When `tracker.working_state` is configured (Section 5.3.1):
+
+Dispatch lock:
+
+- On dispatch, the orchestrator should transition the issue to `working_state` in the tracker
+  (best-effort, non-blocking).
+- Candidate selection should exclude issues already in `working_state` unless they are claimed by the
+  current orchestrator instance.
+- This makes the in-memory claim visible in the tracker, acting as a distributed lock that survives
+  restarts and is visible to other orchestrator instances sharing the same board.
+
+Startup reset:
+
+- Before the first tick, query the tracker for all issues in `working_state`.
+- For each stale issue, transition it back to the first non-working active state (for example
+  `Todo`) and post an audit comment noting the restart.
+- Skip reset if `active_states` contains only the working state (no distinct ready state to reset
+  to).
+- Individual reset failures should be logged at warn level without aborting startup.
+
+This prevents issues from being stuck in a "claimed but nobody is working on it" state after a crash
+or restart.
+
+### 8.10 Operator Halt / Andon Cord (Recommended Extension)
+
+A halt mechanism lets operators (or the worker itself) freeze new dispatch when continuing would
+cause more harm than waiting. Modeled on the Toyota Production System andon cord: any participant
+can pull it; only a human can clear it.
+
+Trigger sources:
+
+- Worker writes a reserved verdict token (for example `HALT_PRODUCTION`) plus a reason file (for
+  example `.symphony/halt-reason.txt`) at end of run.
+- Orchestrator self-engages on classified failure modes (Section 8.10.1).
+- Operator engages manually via a control surface (CLI, dashboard, or filesystem).
+
+Lock representation:
+
+- Recommended: a filesystem lock file at a known path (for example `<state_dir>/andon/<scope>.lock`
+  for per-workflow halts, `<state_dir>/andon/global.lock` for fleet-wide halts).
+- The lock file's contents are a structured record: trigger source, category (Section 8.10.1),
+  reason text, ISO timestamp, originating issue identifier (when applicable).
+
+Effect on dispatch:
+
+- While the relevant lock is present, candidate selection skips dispatch for the matching scope.
+- Active runs are not killed by halt engagement — running workers complete their turn and are not
+  re-dispatched. Operators may opt to kill runs separately.
+- The halt is observable in the snapshot API and the dashboard.
+
+Clearing:
+
+- No programmatic clear API by design. Operators remove the lock file (or run an audit-trail
+  skill that removes it and posts a comment trail).
+- This intentional friction prevents accidental clear-and-rerun loops.
+
+#### 8.10.1 Halt Categories (Recommended Closed Union)
+
+Halts should carry a category drawn from a closed set so dashboards can group and operators can
+search. Recommended categories:
+
+- `halt_production` — explicit worker- or operator-pulled halt
+- `verdict_unknown` — worker wrote a verdict not in the workflow's `verdict_state_map`
+- `verdict_missing` — worker exited without writing `.symphony/verdict.txt`
+- `lease_invalid` — orchestrator detected a lease/epoch mismatch on a tracker write (Section
+  11.6.1)
+- `schema_drift` — config file references an alphabet member the build doesn't know about
+- `rank_violation` — candidate selection produced an issue ineligible by `active_states`
+- `quota_wall` — fleet-wide budget cap reached (Section 8.11)
+- `agent_error` — repeated agent subprocess crashes within a rolling window
+- `other` — escape hatch; operators should re-categorize after triage
+
+Implementations may extend this union but should not repurpose existing categories.
+
+### 8.11 Fleet-Wide Token Budget (Recommended Extension)
+
+When a coding agent is billed by subscription tier rather than per-call (for example Claude
+Code's session/weekly token quotas), a per-issue dollar cap (Section 8.8) is the wrong abstraction.
+Implementations should consider a token-based fleet ledger that crosses workflow boundaries.
+
+Schema:
+
+- `fleet.tokens_cap_per_hour` (integer, optional)
+- `fleet.tokens_cap_per_session` (integer, optional) — typical session window 5 hours
+- `fleet.tokens_cap_per_week` (integer, optional)
+- Storage: a single ledger file (for example `<state_dir>/fleet-budget-shared.json`) shared by all
+  orchestrator processes for the fleet.
+- Concurrency: cooperative POSIX file lock (`flock`) on the ledger file during read-modify-write.
+
+Cap semantics:
+
+- Each completed agent run records its consumed token count to the ledger.
+- Pre-dispatch check sums tokens within each rolling window and refuses dispatch if any cap would
+  be exceeded by a worst-case run.
+- A breach engages a `quota_wall` halt (Section 8.10.1). Operators may raise the cap on a feature
+  branch and merge; the orchestrator restart re-reads `fleet.json`.
+
+Why token-based, not dollar-based:
+
+- Subscription billing decouples per-token cost from monthly spend. Token caps reflect actual quota
+  exhaustion; dollar caps invent a number that doesn't correspond to a cliff.
+- Tier-aware presets (for example `MAX_5X` vs `MAX_20X` env vars) let the same code adapt to
+  subscription changes without code edits.
+
+### 8.12 Pre-Dispatch Guard Chain (Recommended Extension)
+
+Every dispatch path should run a list of read-only guards before launching a worker. Each guard
+returns a boolean: `true` blocks dispatch with a structured reason. The first guard returning
+`true` halts the chain.
+
+Guard list is a `ReadonlyArray<Guard>` registered at startup. Recommended starter guards:
+
+- `AbandonedDesyncGuard` — refuses dispatch if the issue is in the persisted `abandoned` set
+  (Section 14.3.1) but the tracker shows it ready. Intervention required.
+- `LoopDetectorGuard` — counts dispatches per issue per rolling window and halts if a threshold is
+  exceeded. Independent of the token ledger so loop detection works even when the ledger is broken.
+- (Implementation-defined additional guards — for example git state assertions, lease validity
+  pre-checks.)
+
+Properties:
+
+- Guards must be side-effect-free. They observe state; they do not mutate it.
+- A blocking guard should record a halt event with the relevant category (`other` if no category
+  fits).
+- The guard list is data-driven so adding a new guard is one entry, not a code path edit.
+
 ## 9. Workspace Management and Safety
 
 ### 9.1 Workspace Layout
@@ -870,6 +1212,24 @@ Execution contract:
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 
+Process group handling:
+
+- Hook subprocesses should be spawned in a new process group (for example `detached: true` on
+  POSIX) so that timeout kills terminate the entire process tree, not just the shell.
+- On timeout, send `SIGTERM` to the negative PID (process group) rather than to the shell process
+  alone. Fall back to direct kill if the process group is already gone.
+- Without this, long-running child processes (for example `git clone`, dependency installs) survive
+  the hook timeout and leak.
+
+Hook environment variables:
+
+- `before_run` and `after_run` hooks should receive a `SYMPHONY_ATTEMPT` environment variable
+  indicating the current run attempt: `"initial"` on the first run for an issue, or a positive
+  integer string (`"1"`, `"2"`, ...) on continuations and retries.
+- This allows hooks to preserve in-progress state across continuation turns (for example skipping
+  a fresh `git fetch` when scratch files from a prior turn are still valid) instead of
+  unconditionally resetting the workspace.
+
 Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
@@ -897,9 +1257,73 @@ Invariant 3: Workspace key is sanitized.
 - Only `[A-Za-z0-9._-]` allowed in workspace directory names.
 - Replace all other characters with `_`.
 
+### 9.6 Workspace Preservation on Abandonment (Recommended Extension)
+
+When the orchestrator decides to stop work on an issue mid-flight (operator moved the card to a
+backlog state, lease invalidated, shutdown drain), it should preserve any uncommitted or unpushed
+worker work before tearing down the workspace, not discard it via `git reset` or `git clean`.
+
+Recommended preservation flow:
+
+1. Detect uncommitted changes (`git status --porcelain`) and unpushed commits (`git rev-list
+   @{u}..HEAD`).
+2. If anything is found, create a preservation branch `abandoned/<original-branch>-<timestamp>` and
+   force-push it to the remote.
+3. Optionally post a tracker comment linking the preservation branch.
+4. Then proceed with workspace teardown.
+
+Why:
+
+- Worker work that the orchestrator decides not to merge may still contain insight (a partial
+  implementation, an approach the operator wants to reuse). Discarding it because the orchestrator
+  changed its mind is destructive.
+- A `git reset --hard` is irreversible from outside the orchestrator. A preservation branch is
+  reversible and observable.
+
+Failures of preservation should be logged and should not block teardown — preservation is
+best-effort, not a correctness gate.
+
+### 9.7 Tick Watchdog and External Supervision (Recommended Extension)
+
+A long-running orchestrator can hang on a stuck syscall, deadlock, or infinite loop without ever
+crashing. Implementations should consider two layers of liveness defense:
+
+In-process tick watchdog:
+
+- Each tick has a deadline (recommended default: 90s).
+- A separate timer fires if the deadline passes; on fire, the orchestrator emits a structured
+  `TICK_TIMEOUT` event and exits with a distinguished exit code.
+- Tracker calls (and other long syscalls) carry their own per-request timeout and emit
+  `STALL_OBSERVED` reducer events on overrun. N stalls in a rolling window engage an `agent_error`
+  halt.
+
+External supervisor:
+
+- The orchestrator runs under a process supervisor (launchd on macOS, systemd on Linux) with an
+  automatic respawn policy and a throttle interval (for example minimum 30s between respawns).
+- A separate reaper script may be used as a kill-switch: `pkill -TERM -- -$PGID` (negative PID =
+  process group) to terminate the entire process tree, not just the parent. This handles cases
+  where in-process timers themselves are stuck.
+
+Properties:
+
+- The orchestrator should write its PID and PGID to a known file at startup so the reaper script
+  can find them deterministically.
+- The supervisor's job is liveness; the orchestrator's job is correctness. Don't conflate them by
+  putting "is the work valid?" logic in the supervisor or "should we restart?" logic in the
+  orchestrator.
+
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
-This section defines the language-neutral contract for integrating a coding agent app-server.
+This section defines the language-neutral contract for integrating a coding agent. The primary
+example uses Codex's app-server JSON-RPC protocol, but the logical contract applies to any coding
+agent that can run as a subprocess and produce structured output.
+
+Implementations using CLI-based agents (for example Claude Code with `--output-format stream-json`)
+that do not use a JSON-RPC app-server protocol may adapt the contracts below to their agent's
+integration model. The essential requirements are: (1) launch the agent in the workspace directory,
+(2) stream structured events back to the orchestrator, (3) detect turn completion/failure, and (4)
+support session continuation across turns.
 
 Compatibility profile:
 
@@ -925,6 +1349,9 @@ Notes:
 
 - The default command is `codex app-server`.
 - Approval policy, cwd, and prompt are expressed in the protocol messages in Section 10.2.
+- CLI-based agents that accept prompt and options as command-line arguments (for example
+  `claude --print --output-format stream-json -p <prompt>`) may be launched directly without
+  `bash -lc` wrapping. The working directory constraint still applies.
 
 Recommended additional process settings:
 
@@ -934,7 +1361,12 @@ Recommended additional process settings:
 
 Reference: https://developers.openai.com/codex/app-server/
 
-The client must send these protocol messages in order:
+Note: CLI-based agents that do not use a JSON-RPC app-server protocol may skip the handshake
+entirely. The session starts implicitly when the subprocess begins producing output. Session
+identifiers should be extracted from the agent's output stream (for example a `session_id` field in
+the result event).
+
+The client must send these protocol messages in order (app-server protocol):
 
 Illustrative startup transcript (equivalent payload shapes are acceptable if they preserve the same
 semantics):
@@ -997,6 +1429,10 @@ Continuation processing:
   on the same live `threadId`.
 - The app-server subprocess should remain alive across those continuation turns and be stopped only
   when the worker run is ending.
+- Alternative for CLI-based agents: spawn a new subprocess with a session-resume flag (for example
+  `--resume <sessionId>`) instead of issuing additional turns on a live subprocess. The agent's
+  result event should include a `reachedTurnLimit` flag (or equivalent) so the orchestrator knows
+  whether to schedule a continuation.
 
 Line handling requirements:
 
@@ -1062,9 +1498,11 @@ Unsupported dynamic tool calls:
 Optional client-side tool extension:
 
 - An implementation may expose a limited set of client-side tools to the app-server session.
-- Current optional standardized tool: `linear_graphql`.
+- Current optional standardized tool: `linear_graphql`. Implementations using a different tracker
+  should define an equivalent tool appropriate to their backend (for example `github_graphql` for
+  GitHub-based implementations).
 - If implemented, supported tools should be advertised to the app-server session during startup
-  using the protocol mechanism supported by the targeted Codex app-server version.
+  using the protocol mechanism supported by the targeted agent version.
 - Unsupported tool names should still return a failure result and continue the session.
 
 `linear_graphql` extension contract:
@@ -1150,7 +1588,7 @@ Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
-## 11. Issue Tracker Integration Contract (Linear-Compatible)
+## 11. Issue Tracker Integration Contract
 
 ### 11.1 Required Operations
 
@@ -1164,6 +1602,9 @@ An implementation must support these tracker adapter operations:
 
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
+
+Implementations may add optional write operations for audit trail and distributed-lock purposes. See
+Section 11.6 for recommended tracker write extensions.
 
 ### 11.2 Query Semantics (Linear)
 
@@ -1187,6 +1628,30 @@ Important:
 A non-Linear implementation may change transport details, but the normalized outputs must match the
 domain model in Section 4.
 
+### 11.2b Query Semantics (GitHub Projects v2)
+
+GitHub-specific requirements for `tracker.kind == "github"`:
+
+- GraphQL endpoint: `https://api.github.com/graphql`
+- Auth token sent in `Authorization: Bearer` header
+- `tracker.project_slug` is in `owner/repo` format
+- `tracker.project_number` identifies the GitHub Projects v2 board
+- `tracker.status_field` names the single-select Status field on the board
+- Candidate issue query fetches all project items and filters by the Status field value client-side
+- Issue identification uses GitHub node IDs for GraphQL mutations and numeric issue/PR numbers for
+  REST operations
+- For typical board sizes (under 500 items), client-side filtering after a single paginated fetch is
+  acceptable. Larger boards may require server-side filtering if GitHub's Projects API supports it.
+- Network timeout: `30000 ms`
+
+Important:
+
+- GitHub Projects v2 uses a different data model than Linear: status is a custom single-select field
+  rather than a built-in state property. The implementation must resolve the field ID and option IDs
+  at startup (cacheable) before performing status reads or writes.
+- GitHub issues and pull requests share the same Projects v2 board. The `Issue` model's `url` field
+  and normalized `identifier` (for example `owner/repo#123`) should distinguish between them.
+
 ### 11.3 Normalization Rules
 
 Candidate issue normalization should produce fields listed in Section 4.1.1.
@@ -1200,16 +1665,19 @@ Additional normalization details:
 
 ### 11.4 Error Handling Contract
 
-Recommended error categories:
+Recommended error categories (generic):
 
 - `unsupported_tracker_kind`
 - `missing_tracker_api_key`
 - `missing_tracker_project_slug`
-- `linear_api_request` (transport failures)
-- `linear_api_status` (non-200 HTTP)
-- `linear_graphql_errors`
-- `linear_unknown_payload`
-- `linear_missing_end_cursor` (pagination integrity error)
+- `tracker_api_request` (transport failures)
+- `tracker_api_status` (non-200 HTTP)
+- `tracker_graphql_errors`
+- `tracker_unknown_payload`
+- `tracker_missing_pagination_cursor` (pagination integrity error)
+
+Implementations may use tracker-kind-specific prefixes (for example `linear_api_request`,
+`github_api_request`) for more precise error routing.
 
 Orchestrator behavior on tracker errors:
 
@@ -1228,6 +1696,50 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
   `Human Review`) rather than tracker terminal state `Done`.
 - If the optional `linear_graphql` client-side tool extension is implemented, it is still part of
   the agent toolchain rather than orchestrator business logic.
+
+### 11.6 Orchestrator-Driven Tracker Writes (Recommended Extension)
+
+While the baseline treats the orchestrator as read-only (Section 11.5), implementations may add
+write operations to the tracker adapter for audit trail and distributed-lock purposes.
+
+Recommended optional operations:
+
+1. `update_issue_state(issue_id, new_state)`
+   - Used on dispatch to transition the issue to a working state (Section 8.9).
+   - Used on completion to transition to a terminal or handoff state.
+
+2. `post_comment(issue_id, body)`
+   - Used to leave an audit trail on the issue when the orchestrator makes state decisions.
+   - Recommended comment convention: `Symphony: -> **NewState** (reason)`.
+
+3. `close_issue(issue_id)`
+   - Used on successful completion when the workflow defines done as issue closure.
+
+All tracker writes should be best-effort and non-blocking. Write failures should be logged but must
+not block orchestrator operation or worker dispatch. The orchestrator remains a scheduler/runner
+first; tracker writes are an observability and coordination enhancement, not a correctness
+requirement.
+
+#### 11.6.1 Optimistic Concurrency for Tracker Writes (Recommended Sub-Extension)
+
+When the orchestrator writes to the tracker for an issue it claimed earlier, a second orchestrator
+process (or a stale worker that was killed and re-dispatched) may try to write conflicting state.
+Implementations should consider an epoch / lease token to detect this.
+
+Recommended scheme:
+
+- On dispatch, the orchestrator mints an `epoch` token (monotonic counter or UUID) and persists it
+  on the tracker (for example as a `symphony:epoch:N` label or a custom field).
+- All effects that mutate tracker state (state transition, close, sub-issue creation) carry an
+  `expectedEpoch`.
+- The tracker write reads the live epoch first and refuses the write if it differs from
+  `expectedEpoch` (CAS pattern). Refused writes raise an `EPOCH_CONFLICT` error and engage a
+  `lease_invalid` halt (Section 8.10.1).
+- The epoch state on the tracker is production state — operators must not "clean up" stale epoch
+  labels because they encode the lock witness.
+
+This is optional but strongly recommended for any deployment running more than one orchestrator
+process against the same board, or where worker subprocesses can outlive their orchestrator.
 
 ## 12. Prompt Construction and Context Assembly
 
@@ -1530,6 +2042,106 @@ API design notes:
 - If the dashboard is a client-side app, it should consume this API rather than duplicating state
   logic.
 
+#### 13.7.3 Server-Sent Events (SSE) Extension
+
+Implementations may expose SSE endpoints for real-time dashboard updates alongside the JSON REST API:
+
+- `GET /api/v1/stream/state`
+  - Broadcasts a full state snapshot on orchestrator state mutations.
+  - Should send an initial snapshot immediately on connect so clients render without waiting for the
+    next mutation.
+  - Burst mutations should be debounced (for example 200ms) to avoid flooding clients during busy
+    ticks.
+
+- `GET /api/v1/stream/<issue_identifier>`
+  - Streams per-issue agent log events in real time.
+  - Should send buffered recent events on connect, then live events filtered by issue ID.
+
+SSE headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`.
+
+Event format should use the standard SSE `data:` field with JSON payloads.
+
+### 13.8 Per-Session Structured Logging (Recommended Extension)
+
+Implementations may write one structured log file per issue per attempt to enable post-mortem
+analysis without parsing shared logs.
+
+Recommended format: NDJSON (newline-delimited JSON), one event per line.
+
+File naming convention:
+
+- Path: `<log_dir>/<sanitized_identifier>-<iso_timestamp>.ndjson`
+- Identifier sanitization: replace non-`[A-Za-z0-9._-]` characters with `_`
+- Timestamp format should be path-safe (no `:` or `.`)
+
+Each agent event (tool use, tool result, rate limit, progress, result) should be appended as a
+standalone JSON line with at minimum:
+
+- `timestamp` (ISO-8601)
+- `type` (event type string)
+- `message` (human-readable summary)
+
+The orchestrator should write a summary record at session end with outcome reason, total cost, and
+budget guard state.
+
+All writes should be best-effort — log file errors should never break the orchestrator.
+
+### 13.9 Reducer Event Log (Recommended Extension)
+
+When implementations adopt the pure reducer architecture (Section 7.5), they should also write an
+append-only event log of every reducer event and the effects it produced. This is the audit
+substrate for replay and forensic reconstruction.
+
+Format: NDJSON, one record per line, written by the interpreter (not the reducer).
+
+Each record should include:
+
+- `timestamp` (ISO-8601)
+- `event` (the input event type and payload)
+- `prev_state_summary` (a stable hash or compact projection — full state may be too large)
+- `effects` (the array of effects emitted by the reducer for this event)
+- `effect_outcomes` (the result of each effect — succeeded, failed with error class)
+
+Properties:
+
+- The log is append-only. Rotation is acceptable (size or time-based) but old segments must be
+  retained for the replay window.
+- Replay tooling consumes this log to reconstruct decisions in a sandbox without live tracker or
+  agent calls.
+- Per-workflow files prevent cross-workflow noise; per-issue files within a workflow are also
+  acceptable.
+
+This log is distinct from per-session NDJSON (Section 13.8): per-session captures the agent's
+output stream; the reducer event log captures the orchestrator's decision stream.
+
+### 13.10 Operator Intervention Log (Recommended Extension)
+
+Operator overrides issued through CLI skills, dashboard buttons, or direct tracker mutations should
+be recorded separately from worker-driven transitions so the audit envelope distinguishes
+human-driven from agent-driven state changes.
+
+Recommended format: NDJSON at `<state_dir>/interventions.ndjson`, one record per intervention.
+
+Recommended fields:
+
+- `timestamp` (ISO-8601)
+- `actor` (identifier for the operator — username, email, or "system" for automated overrides)
+- `kind` (closed union: `close`, `defer`, `revive`, `priority_change`, `halt_clear`,
+  `epoch_reset`, `other`)
+- `subject` (the issue identifier, PR number, or scope key affected)
+- `reason` (free-text justification supplied by the operator)
+- `metadata` (kind-specific payload — for example old/new priority for `priority_change`)
+
+Properties:
+
+- Append-only; never edited or truncated.
+- Reviewable by humans (it is the diff between what the orchestrator wanted and what humans did).
+- Source data for weekly autonomy/intervention reports.
+
+Skills that mutate state outside the orchestrator's normal flow (close, defer, halt clear) should
+write to this log as part of their own atomic flow, not depend on the orchestrator picking up the
+mutation later.
+
 ## 14. Failure Model and Recovery Strategy
 
 ### 14.1 Failure Classes
@@ -1596,8 +2208,31 @@ After restart:
 - No running sessions are assumed recoverable.
 - Service recovers by:
   - startup terminal workspace cleanup
+  - working-state reset if `tracker.working_state` is configured (Section 8.9)
   - fresh polling of active issues
   - re-dispatching eligible work
+
+#### 14.3.1 Persistent Budget State Across Restarts (Recommended Extension)
+
+Implementations with budget guards (Section 8.8) should persist per-issue limit counters and
+abandoned-issue sets to disk so that caps survive process restarts. Without persistence, a restart
+resets all counters to zero, allowing a capped issue to consume another full budget cycle.
+
+Recommended approach:
+
+- Store `issue_limits` (per-issue continuation count, failure retry count, cumulative cost) and
+  `abandoned` (set of issue IDs that hit a budget cap) in a JSON file.
+- Use atomic writes (write to a temporary file, then rename into place) to avoid corruption on
+  crash.
+- Use per-workflow file isolation (for example `issue-limits-dev.json`,
+  `issue-limits-pr-review.json`) to prevent cross-contamination between parallel orchestrators.
+- Load the file at the top of `start()` before the first tick.
+- Save after every counter mutation. Burst mutations during a busy tick should be coalesced into one
+  deferred write.
+- Clear per-issue entries when an issue reaches a terminal state naturally (success or external
+  transition detected by reconciliation). Do not clear on abandonment — the whole point is that
+  abandonment must survive restart.
+- Quarantine corrupt files (for example rename to `*.corrupt-<timestamp>`) on load and start fresh.
 
 ### 14.4 Operator Intervention Points
 
@@ -1952,7 +2587,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Invalid YAML front matter returns typed error
 - Front matter non-map returns typed error
 - Config defaults apply when optional values are missing
-- `tracker.kind` validation enforces currently supported kind (`linear`)
+- `tracker.kind` validation enforces a supported tracker kind
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
@@ -1980,13 +2615,14 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 ### 17.3 Issue Tracker Client
 
 - Candidate issue fetch uses active states and project slug
-- Linear query uses the specified project filter field (`slugId`)
+- Tracker query uses the tracker-kind-specific project identifier (for example Linear `slugId`,
+  GitHub `project_number`)
 - Empty `fetch_issues_by_states([])` returns empty without API call
 - Pagination preserves order across multiple pages
 - Blockers are normalized from inverse relations of type `blocks`
 - Labels are normalized to lowercase
 - Issue state refresh by ID returns minimal normalized issues
-- Issue state refresh query uses GraphQL ID typing (`[ID!]`) as specified in Section 11.2
+- Issue state refresh query uses the tracker-kind-appropriate ID typing
 - Error mapping for request errors, non-200, GraphQL errors, malformed payloads
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
@@ -2008,12 +2644,13 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
 
-### 17.5 Coding-Agent App-Server Client
+### 17.5 Coding-Agent Client
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
-- Startup handshake sends `initialize`, `initialized`, `thread/start`, `turn/start`
-- `initialize` includes client identity/capabilities payload required by the targeted Codex
-  app-server protocol
+- Launch command uses workspace cwd and invokes the agent backend startup sequence (for example
+  `bash -lc <codex.command>` for Codex, or direct CLI spawn for Claude Code)
+- Startup handshake follows the agent backend's protocol (for example `initialize` / `initialized` /
+  `thread/start` / `turn/start` for Codex app-server; implicit start for CLI-based agents)
+- Startup payloads include client identity/capabilities required by the targeted agent protocol
 - Policy-related startup payloads use the implementation's documented approval/sandbox settings
 - `thread/start` and `turn/start` parse nested IDs and emit `session_started`
 - Request/response read timeout is enforced
@@ -2105,12 +2742,34 @@ Use the same validation profiles as Section 17:
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
 - Optional `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
-- TODO: Persist retry queue and session metadata across process restarts.
-- TODO: Make observability settings configurable in workflow front matter without prescribing UI
-  implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- Multiple workflow files per codebase with a registry mapping deployments to their config (Section
+  5.1.1).
+- Closed-alphabet `verdict_state_map` routing with explicit `done_state` and
+  `paused_states`/`backlog_states` categories (Sections 5.3.1, 5.3.7).
+- Per-workflow `rules` block declaring worker `must`/`must_not`/`limits` separately from prompt
+  body (Section 5.3.8).
+- Generated workflow alphabets feeding compile-time exhaustiveness checks (Section 5.6).
+- Pure reducer / interpreter split (TEA architecture) with mechanical purity enforcement (Section
+  7.5).
+- Rate-limit gating that suppresses new dispatch when the agent emits rate-limit events with timing
+  hints (Section 8.7).
+- Per-issue budget guards: `max_continuations`, `max_failure_retries`, `max_cost_per_issue_usd`
+  (Section 8.8).
+- Working-state dispatch lock with startup reset for crash recovery (Section 8.9).
+- Operator halt / andon cord with closed-union halt categories (Sections 8.10, 8.10.1).
+- Fleet-wide token-based budget ledger spanning multiple orchestrator processes (Section 8.11).
+- Pre-dispatch guard chain (abandoned-desync, loop detector, etc.) (Section 8.12).
+- Workspace preservation on abandonment via `abandoned/<branch>-<ts>` push instead of `git reset`
+  (Section 9.6).
+- Tick watchdog plus external supervisor (launchd/systemd) with process-group reaper (Section 9.7).
+- Orchestrator-driven tracker writes for audit trail and distributed coordination (Section 11.6).
+- Optimistic concurrency / epoch CAS on tracker writes (Section 11.6.1).
+- Pluggable issue tracker adapters beyond Linear, for example GitHub Projects v2 (Section 11.2b).
+- SSE streaming endpoints for real-time dashboard updates (Section 13.7.3).
+- Per-session NDJSON structured logging (Section 13.8).
+- Reducer event log (append-only NDJSON of every event + emitted effects) (Section 13.9).
+- Operator intervention NDJSON log distinct from worker-driven transitions (Section 13.10).
+- Persistent budget state across restarts (Section 14.3.1).
 
 ### 18.3 Operational Validation Before Production (Recommended)
 
